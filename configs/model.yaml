@@ -1,0 +1,8 @@
+# configs/model.yaml
+arch: unet++            # UNet++ (nested U-Net)
+encoder: resnet34
+encoder_weights: imagenet
+in_channels: 3
+num_classes: 3          # keep in sync with dataset.yaml:C
+dropout: 0.1
+use_edge_aux: false     # optional edge-aware aux head (Sobel)

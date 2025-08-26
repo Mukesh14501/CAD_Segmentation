@@ -1,0 +1,14 @@
+# configs/aug.yaml
+train:
+  flip: true
+  rotate90: true
+  scale_jitter: 0.1          # ±10%
+  brightness_contrast: 0.1
+  gaussian_noise_std: 0.01
+  gaussian_blur_ksize: 3     # set 0 to disable
+  tiny_affine_px: 2          # translate ≤2px; no elastic to avoid bending lines
+valid:
+  resize: null               # or "fit_long_side: 2048"
+  center_crop: null
+infer:
+  pad_to_tile: true

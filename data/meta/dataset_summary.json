@@ -1,0 +1,12 @@
+{
+  "num_images": 50,
+  "per_class": {
+    "dimension_overlap": {
+      "images_with_positive": 50,
+      "total_positive_px": 1664708
+    }
+  },
+  "missing_masks": {
+    "dimension_overlap": 0
+  }
+}

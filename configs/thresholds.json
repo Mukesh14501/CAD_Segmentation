@@ -1,0 +1,5 @@
+{
+  "rule_00_arrow_not_touching": 0.5,
+  "rule_01_text_overlap_line": 0.5,
+  "rule_02_missing_dimension": 0.5
+}

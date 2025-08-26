@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+env/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Data & runs
+# data/images/
+# data/masks/
+# data/splits/
+runs/
+outputs/
+checkpoints/
+.wandb/
+mlruns/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+test.ipynb
