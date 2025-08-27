@@ -101,3 +101,55 @@ class SegmentationMetrics:
 
         # Macro averages over classes that have GT support > 0
         present = self.support > 0
+        present_count = max(1, int(present.sum().item()))
+        macro_iou_present = iou[present].mean().item() if present.any() else float("nan")
+        macro_dice_present = dice[present].mean().item() if present.any() else float("nan")
+        macro_prec_present = prec[present].mean().item() if present.any() else float("nan")
+        macro_rec_present = rec[present].mean().item() if present.any() else float("nan")
+
+        # Macro over all classes (includes absent classes)
+        macro_iou_all = iou.mean().item()
+        macro_dice_all = dice.mean().item()
+        macro_prec_all = prec.mean().item()
+        macro_rec_all = rec.mean().item()
+
+        out = {
+            "per_class": {
+                "tp": self.TP.tolist(),
+                "fp": self.FP.tolist(),
+                "fn": self.FN.tolist(),
+                "tn": self.TN.tolist(),
+                "support_px": self.support.tolist(),
+                "iou": iou.tolist(),
+                "dice": dice.tolist(),
+                "precision": prec.tolist(),
+                "recall": rec.tolist(),
+            },
+            "macro_present": {
+                "iou": macro_iou_present,
+                "dice": macro_dice_present,
+                "precision": macro_prec_present,
+                "recall": macro_rec_present,
+                "num_present_classes": present_count,
+            },
+            "macro_all": {
+                "iou": macro_iou_all,
+                "dice": macro_dice_all,
+                "precision": macro_prec_all,
+                "recall": macro_rec_all,
+            },
+            "micro": self._compute_micro().copy(),  # across all pixels/classes
+        }
+        return out
+
+    def _compute_micro(self) -> Dict[str, float]:
+        TP = self.TP.sum().item()
+        FP = self.FP.sum().item()
+        FN = self.FN.sum().item()
+        TN = self.TN.sum().item()
+        iou = (TP / (TP + FP + FN + 1e-8)) if (TP + FP + FN) > 0 else float("nan")
+        dice = (2 * TP / (2 * TP + FP + FN + 1e-8)) if (2 * TP + FP + FN) > 0 else float("nan")
+        prec = (TP / (TP + FP + 1e-8)) if (TP + FP) > 0 else float("nan")
+        rec = (TP / (TP + FN + 1e-8)) if (TP + FN) > 0 else float("nan")
+        acc = ((TP + TN) / (TP + FP + FN + TN + 1e-8)) if (TP + FP + FN + TN) > 0 else float("nan")
+        return {"iou": iou, "dice": dice, "precision": prec, "recall": rec, "accuracy": acc}
