@@ -427,7 +427,7 @@ def main():
 
     epoch_offset = _next_epoch_offset(metrics_dir)
     print(f"[metrics] continuing from global epoch index = {epoch_offset}")
-
+    
     # Validation callback using full-image stitched eval on the VALID split only
     def _validate(epoch: int) -> Dict:
         metrics = _evaluate_on_ids(
@@ -456,6 +456,23 @@ def main():
             f"macroDice={metrics['macro_all']['dice']:.4f}")
 
         return metrics
+
+
+    # ----- Fit -----
+    hist = trainer.fit(train_loader, validate_fn=_validate, start_epoch=0)
+
+    print("\nFine-tuning complete." if finetune_mode else "\nTraining complete.")
+    print(f"Run directory: {run_dir.resolve()}")
+    if (ckpt_dir / "best.pth").exists():
+        print(f"Best checkpoint: {ckpt_dir / 'best.pth'}")
+
+    # Save manifests for next run comparison
+    try:
+        _save_train_ids(run_dir, train_ids)
+        _save_classes(run_dir, class_names)
+    except Exception as e:
+        print(f"[meta] Failed to save manifests: {e}")
+
 
 if __name__ == "__main__":
     main()
