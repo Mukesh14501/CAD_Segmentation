@@ -1,4 +1,3 @@
-# cadseg/dataio/ingest.py
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -14,11 +13,18 @@ def _read_lines(p: Path) -> List[str]:
         return []
     return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
-def _append_lines(p: Path, lines: List[str]) -> None:
+def _append_unique_lines(p: Path, lines: List[str]) -> None:
+    """
+    Append only new (non-duplicate) IDs, preserving existing content.
+    Ensures parent dir exists.
+    """
     p.parent.mkdir(parents=True, exist_ok=True)
+    existing = set(_read_lines(p))
     with p.open("a", encoding="utf-8") as f:
         for ln in lines:
-            f.write(ln + "\n")
+            if ln not in existing:
+                f.write(ln + "\n")
+                existing.add(ln)
 
 def _scan_max_id(images_dir: Path) -> int:
     max_id = 0
@@ -53,30 +59,35 @@ def ingest_week(
     weekly_drop_root: Path,
     *,
     seed: int = 42,
-    train_ratio: float = 0.9,
+    train_ratio: float = 0.8,   # 80/20 as requested
 ) -> Dict:
     """
     Ingest a weekly drop into canonical data tree.
 
-    Expected canonical tree:
-    data/
-      images/
-      masks/
-        rule_00/
-        rule_01/
-        ...
+    Canonical tree:
+      data/
+        images/
+        masks/
+          <class_a>/
+          <class_b>/
+        splits/
+          train.txt
+          valid.txt
+        meta/
+          latest_id.txt
+          ingest_log.jsonl
 
-    Expected weekly drop shape (two common patterns supported):
+    Weekly drop (both patterns supported):
       A) <weekly_drop_root>/
            images/1.png,2.png,...
-           masks/rule_xx/1.png,2.png,...
+           masks/<class_x>/1.png,2.png,...
       B) <weekly_drop_root>/
            1.png,2.png,...               (images in root)
-           masks/rule_xx/1.png,...
+           masks/<class_x>/1.png,...
 
-    Returns summary dict including id map {old->new} and split assignment.
+    Returns summary dict including id map {old->new}, and which new IDs were
+    appended to train/valid. Validation becomes: <previous valid> + 20% new.
     """
-
     images_root = dataset_root / "images"
     masks_root  = dataset_root / "masks"
     splits_dir  = dataset_root / "splits"
@@ -91,9 +102,7 @@ def ingest_week(
     # Collect new image files (numeric names only)
     new_imgs = _collect_numeric_files(src_images_dir)
     if not new_imgs:
-        raise FileNotFoundError(
-            f"No numeric images like '1.png' found under: {src_images_dir}"
-        )
+        raise FileNotFoundError(f"No numeric images like '1.png' found under: {src_images_dir}")
 
     # Determine class subdirs present in weekly masks
     src_masks_root = weekly_drop_root / "masks"
@@ -110,8 +119,6 @@ def ingest_week(
     rng = random.Random(seed)
 
     id_map: Dict[str, str] = {}  # "old_id_str" -> "new_id_str"
-    assigned_train: List[str] = []
-    assigned_valid: List[str] = []
 
     # Copy images and same-index masks with offset
     for src_img in new_imgs:
@@ -121,38 +128,38 @@ def ingest_week(
         new_id = offset + old_id  # 1->offset+1, 2->offset+2, ...
 
         # Copy image
-        dst_img = _copy_with_new_id(src_img, images_root, new_id)
+        _copy_with_new_id(src_img, images_root, new_id)
 
-        # Copy masks in each class dir if present
+        # Copy masks in each class dir if present; create class folder if missing
         for cdir in class_dirs:
             src_mask = cdir / f"{old_id}{src_img.suffix}"
             if src_mask.exists():
                 dst_cdir = masks_root / cdir.name
                 _copy_with_new_id(src_mask, dst_cdir, new_id)
             else:
-                # If mask missing, we leave it absent; your loader treats missing as all-zero
+                # Missing mask for this image/class: leave absent (treated as all-zero)
                 pass
 
         id_map[str(old_id)] = str(new_id)
 
-    # New global max (for info)
+    # Update latest_id.txt
     new_global_max = _scan_max_id(images_root)
     (meta_dir / "latest_id.txt").write_text(str(new_global_max), encoding="utf-8")
 
-    # 90/10 split: deterministic but shuffled IDs
+    # Split only the *new* IDs into 80/20 and append to existing splits
     new_ids = sorted(id_map.values(), key=lambda s: int(s))
     rng.shuffle(new_ids)
     n_train = int(round(train_ratio * len(new_ids)))
     new_train_ids = new_ids[:n_train]
     new_valid_ids = new_ids[n_train:]
 
-    # Append to splits
+    # Append with dedupe (valid = previous valid + new 20%)
     train_txt = splits_dir / "train.txt"
     valid_txt = splits_dir / "valid.txt"
-    _append_lines(train_txt, new_train_ids)
-    _append_lines(valid_txt, new_valid_ids)
+    _append_unique_lines(train_txt, new_train_ids)
+    _append_unique_lines(valid_txt, new_valid_ids)
 
-    # Write an ingest log (nice for audit)
+    # Write ingest log (for auditability)
     summary = {
         "weekly_drop_root": str(weekly_drop_root),
         "offset_applied": offset,
@@ -160,9 +167,12 @@ def ingest_week(
         "new_train_ids": new_train_ids,
         "new_valid_ids": new_valid_ids,
         "new_global_max_id": new_global_max,
+        "counts": {
+            "num_new_images": len(new_imgs),
+            "num_classes_seen": len(class_dirs),
+        },
     }
-    (meta_dir / "ingest_log.jsonl").open("a", encoding="utf-8").write(
-        json.dumps(summary, ensure_ascii=False) + "\n"
-    )
+    with (meta_dir / "ingest_log.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
     return summary

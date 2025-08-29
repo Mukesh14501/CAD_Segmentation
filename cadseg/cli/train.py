@@ -1,33 +1,18 @@
 # cadseg/cli/train.py
 """
 CLI: train.py
-End-to-end starter training script with automatic fine-tune support:
-- Reads configs & (optional) train/valid split lists
-- Builds tiled datasets and a class-balanced batch sampler
-- Constructs UNet++(ResNet-34) model + Dice/BCE (or other) loss
-- Trains with AMP, encoder warmup freeze/unfreeze, checkpointing, early stopping
-- Runs stitched full-image validation each epoch (no tile leakage)
-- If checkpoints/best.pth exists in run_dir, fine-tunes instead of training from scratch.
-  By default, fine-tunes on only NEW training IDs (compared to last run manifest).
+End-to-end trainer with automatic class discovery & safe fine-tune on class-set changes.
 
-Usage (minimal):
+- Auto-discovers classes from data/<...>/masks/<class_name>/ subfolders
+- Rebuilds model head to len(classes) dynamically
+- Loads existing checkpoints safely (skips head if class count changed)
+- Fine-tunes on full train set when classes changed (to avoid forgetting)
+- Optionally fine-tunes only "new IDs" otherwise
+
+Usage:
   python -m cadseg.cli.train --configs configs --run_dir runs/exp1
-
-Optional:
-  # If you have splits in data/splits/train.txt and valid.txt (one image_id per line)
-  python -m cadseg.cli.train --run_dir runs/exp1
-
-  # Quick smoke run with fewer val images
-  python -m cadseg.cli.train --limit_valid 10 --run_dir runs/exp_debug
-
-Fine-tune options:
-  # Gentle FT on new data only (if best.pth exists)
-  python -m cadseg.cli.train --configs configs --run_dir runs/exp1 \
-      --finetune_epochs 6 --finetune_lr 1e-4 --freeze_encoder_stages_ft 2
-
-  # Force FT on full train set even if no new data
-  python -m cadseg.cli.train --configs configs --run_dir runs/exp1 \
-      --force_full_finetune --finetune_epochs 8 --finetune_lr 5e-5
+  # quick debug:
+  python -m cadseg.cli.train --configs configs --run_dir runs/exp_debug --limit_valid 10
 """
 from __future__ import annotations
 
@@ -57,9 +42,9 @@ from cadseg.models.losses import build_loss
 from cadseg.models.metrics import SegmentationMetrics
 from cadseg.engine.train_loop import Trainer
 
-# (Optional) corporate proxy env (safe to keep as no-op if not used)
-os.environ.setdefault("http_proxy", "http://proxy50.adm.toyota.co.jp:15520")
-os.environ.setdefault("https_proxy", "http://proxy50.adm.toyota.co.jp:15520")
+# (Optional) corporate proxy env (safe no-op if not used)
+os.environ.setdefault("http_proxy", os.environ.get("http_proxy", ""))
+os.environ.setdefault("https_proxy", os.environ.get("https_proxy", ""))
 
 
 # ---------------------------
@@ -94,8 +79,7 @@ def _filter_dataset_to_ids(ds: TiledDataset, keep_ids: List[str]) -> None:
     if not keep_ids:
         return
     idset = set(keep_ids)
-    new_paths = []
-    new_ids = []
+    new_paths, new_ids = [], []
     for p, iid in zip(ds.image_paths, ds.ids):
         if iid in idset:
             new_paths.append(p)
@@ -128,8 +112,22 @@ def _maybe_save_splits(root: Path, train_ids: List[str], valid_ids: List[str]) -
 
 
 # ---------------------------
-# Fine-tune metadata helpers
+# Class discovery & metadata
 # ---------------------------
+def _discover_classes(masks_root: Path) -> List[str]:
+    """Return sorted list of class names from subfolders under masks_root."""
+    if not masks_root.exists():
+        return []
+    exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".npy"}
+    classes = []
+    for sub in sorted(p for p in masks_root.iterdir() if p.is_dir()):
+        # keep folder only if it contains any mask file
+        has_files = any(fp.suffix.lower() in exts for fp in sub.glob("*"))
+        if has_files:
+            classes.append(sub.name)
+    return classes
+
+
 def _meta_dir(run_dir: Path) -> Path:
     d = run_dir / "meta"
     d.mkdir(parents=True, exist_ok=True)
@@ -138,6 +136,10 @@ def _meta_dir(run_dir: Path) -> Path:
 
 def _train_manifest_path(run_dir: Path) -> Path:
     return _meta_dir(run_dir) / "train_ids.json"
+
+
+def _classes_manifest_path(run_dir: Path) -> Path:
+    return _meta_dir(run_dir) / "classes.json"
 
 
 def _load_prev_train_ids(run_dir: Path) -> List[str]:
@@ -151,8 +153,37 @@ def _load_prev_train_ids(run_dir: Path) -> List[str]:
 
 
 def _save_train_ids(run_dir: Path, ids: List[str]) -> None:
-    p = _train_manifest_path(run_dir)
-    p.write_text(json.dumps(ids, ensure_ascii=False, indent=2), encoding="utf-8")
+    _train_manifest_path(run_dir).write_text(json.dumps(ids, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_prev_classes(run_dir: Path) -> List[str]:
+    p = _classes_manifest_path(run_dir)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def _save_classes(run_dir: Path, classes: List[str]) -> None:
+    _classes_manifest_path(run_dir).write_text(json.dumps(classes, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_checkpoint_flexible(model: torch.nn.Module, state: Dict[str, torch.Tensor]) -> Dict[str, int]:
+    """Load only params with matching names AND shapes (skip head safely)."""
+    if isinstance(state, dict) and "model" in state:
+        state = state["model"]
+    msd = model.state_dict()
+    filtered = {k: v for k, v in state.items() if k in msd and msd[k].shape == v.shape}
+    # use strict=False so missing keys (e.g., new head) are left initialized
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    return {
+        "loaded": len(filtered),
+        "skipped_from_ckpt": len(state) - len(filtered),
+        "missing_in_model": len(missing),
+        "unexpected_in_ckpt": len(unexpected),
+    }
 
 
 # ---------------------------
@@ -208,28 +239,14 @@ def _evaluate_on_ids(
             ms.append(m.astype(np.float32))
         target = np.stack(ms, axis=0)
 
-        # Update metrics
-        lt = torch.from_numpy(logits).unsqueeze(0)
-        tt = torch.from_numpy(target).unsqueeze(0)
+        # Update metrics (logits + targets as float)
+        lt = torch.from_numpy(logits).unsqueeze(0).float()
+        tt = torch.from_numpy(target).unsqueeze(0).float()
         metrics.update(lt, tt)
 
         count += 1
 
-    try:
-        out = metrics.compute()
-    except Exception as e:
-        print(f"[valid] metrics.compute() failed: {e}")
-        out = None
-
-    # If nothing was evaluated or something went wrong, return a safe default
-    if out is None:
-        out = {
-            "per_class": {},
-            "macro_present": {"iou": 0.0, "dice": 0.0, "precision": 0.0, "recall": 0.0, "num_present_classes": 0},
-            "macro_all":     {"iou": 0.0, "dice": 0.0, "precision": 0.0, "recall": 0.0},
-            "micro":         {"iou": 0.0, "dice": 0.0, "precision": 0.0, "recall": 0.0, "accuracy": 0.0},
-        }
-
+    out = metrics.compute()
     out["macro_mIoU"] = out["macro_all"]["iou"]
     return out
 
@@ -262,6 +279,19 @@ def main():
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # ----- Auto-discover classes from masks directory -----
+    discovered = _discover_classes(ds_cfg.masks_path)
+    if discovered:
+        if set(discovered) != set(ds_cfg.classes):
+            print(f"[classes] Overriding dataset classes from masks: {ds_cfg.classes} -> {discovered}")
+        class_names = discovered
+    else:
+        class_names = list(ds_cfg.classes)  # fallback to config
+
+    # ensure model.num_classes matches discovered classes
+    md_cfg.num_classes = len(class_names)
+    C = len(class_names)
+
     # ----- Splits -----
     splits_dir = ds_cfg.root_path / "splits"
     train_ids = _read_id_list(splits_dir / "train.txt")
@@ -271,37 +301,37 @@ def main():
         train_ids, valid_ids = _auto_split_if_missing(ds_cfg.images_path, seed=ds_cfg.seed, train_ratio=0.8)
         _maybe_save_splits(ds_cfg.root_path, train_ids, valid_ids)
 
-    class_names = ds_cfg.classes
-    C = len(class_names)
-
-    # ----- Fine-tune mode detection & new IDs -----
+    # ----- Fine-tune mode detection & delta -----
     best_ckpt = (ckpt_dir / "best.pth")
     has_ckpt = best_ckpt.exists()
 
     prev_train_ids = _load_prev_train_ids(run_dir)
-    prev_set = set(prev_train_ids)
-    new_train_ids = [iid for iid in train_ids if iid not in prev_set]
+    prev_classes = _load_prev_classes(run_dir)
+    classes_changed = bool(prev_classes) and (prev_classes != class_names)
+
+    new_train_ids = [iid for iid in train_ids if iid not in set(prev_train_ids)]
 
     finetune_mode = has_ckpt  # choose FT if a best checkpoint already exists
-
     if finetune_mode:
         print(f"[info] Found checkpoint for fine-tuning: {best_ckpt}")
-        if not args.force_full_finetune:
-            if len(new_train_ids) == 0:
-                print("[warn] No NEW train IDs detected since last run. "
-                      "Falling back to full train set for fine-tuning.")
-            else:
-                print(f"[info] Fine-tuning on NEW images only: {len(new_train_ids)} / {len(train_ids)}")
+        if classes_changed:
+            print(f"[info] Class set changed: {prev_classes} -> {class_names}. "
+                  f"Will fine-tune on FULL train set and load checkpoint head safely.")
+        elif not args.force_full_finetune and len(new_train_ids) > 0:
+            print(f"[info] Fine-tuning on NEW images only: {len(new_train_ids)} / {len(train_ids)}")
+        elif not args.force_full_finetune:
+            print("[warn] No NEW train IDs detected since last run. Falling back to full train set for fine-tuning.")
 
     # ----- Datasets & Loaders -----
     train_ds = TiledDataset(
         ds_cfg, class_names, stage="train", aug_cfg=aug_cfg, preload_index=False,
         min_positive_area=ds_cfg.min_positive_area,
     )
-    _filter_dataset_to_ids(train_ds, train_ids)
-    if finetune_mode and not args.force_full_finetune and len(new_train_ids) > 0:
-        # restrict to new data only
-        _filter_dataset_to_ids(train_ds, new_train_ids)
+    # Restrict to IDs
+    train_ids_effective = list(train_ids)
+    if finetune_mode and not classes_changed and not args.force_full_finetune and len(new_train_ids) > 0:
+        train_ids_effective = new_train_ids
+    _filter_dataset_to_ids(train_ds, train_ids_effective)
 
     valid_ds = TiledDataset(
         ds_cfg, class_names, stage="valid", aug_cfg=aug_cfg, preload_index=False,
@@ -328,23 +358,21 @@ def main():
     # ----- Model & Loss -----
     model = build_model(md_cfg)
 
-    # ----- Load checkpoint if fine-tuning -----
+    # ----- Load checkpoint if fine-tuning (safe when classes changed) -----
     if finetune_mode:
         try:
             state = torch.load(best_ckpt, map_location="cpu")
-            if isinstance(state, dict) and "model" in state:
-                state = state["model"]
-            missing, unexpected = model.load_state_dict(state, strict=False)
-            if missing:
-                print(f"[ft] Missing keys (ok if heads changed): {len(missing)}")
-            if unexpected:
-                print(f"[ft] Unexpected keys: {len(unexpected)}")
+            stats = _load_checkpoint_flexible(model, state)
+            print(f"[ft] Restored {stats['loaded']} tensors from checkpoint "
+                  f"(skipped_from_ckpt={stats['skipped_from_ckpt']}, "
+                  f"missing_in_model={stats['missing_in_model']}, "
+                  f"unexpected_in_ckpt={stats['unexpected_in_ckpt']}).")
         except Exception as e:
             print(f"[ft] Failed to load checkpoint '{best_ckpt}': {e}")
             print("[ft] Proceeding with training from scratch...")
-            finetune_mode = False  # fallback to standard training
+            finetune_mode = False  # fallback
 
-        # Adjust training config for FT (if still in FT mode)
+        # Adjust training config for FT
         if finetune_mode:
             if args.finetune_lr is not None:
                 tr_cfg.lr = args.finetune_lr
@@ -353,7 +381,6 @@ def main():
                 tr_cfg.epochs = args.finetune_epochs
                 print(f"[ft] Overriding epochs for fine-tune: {tr_cfg.epochs}")
             if args.freeze_encoder_stages_ft and args.freeze_encoder_stages_ft > 0:
-                # Trainer.__post_init__ will respect freeze_encoder_stages
                 tr_cfg.freeze_encoder_stages = args.freeze_encoder_stages_ft
                 print(f"[ft] Freezing first {tr_cfg.freeze_encoder_stages} encoder stages during FT")
 
@@ -381,6 +408,26 @@ def main():
 
     device = _pick_device()
 
+    metrics_dir = run_dir / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+
+    def _next_epoch_offset(dirpath: Path) -> int:
+        """Return max existing epoch index + 1, or 0 if none."""
+        max_idx = -1
+        for p in dirpath.glob("epoch_*.json"):
+            stem = p.stem  # e.g., "epoch_012"
+            try:
+                idx = int(stem.split("_")[-1])
+                if idx > max_idx:
+                    max_idx = idx
+            except ValueError:
+                # ignore any unexpected files
+                pass
+        return max_idx + 1
+
+    epoch_offset = _next_epoch_offset(metrics_dir)
+    print(f"[metrics] continuing from global epoch index = {epoch_offset}")
+
     # Validation callback using full-image stitched eval on the VALID split only
     def _validate(epoch: int) -> Dict:
         metrics = _evaluate_on_ids(
@@ -388,29 +435,27 @@ def main():
             thresholds=0.5, tile_bs=args.tile_bs, device=device,
             limit=(args.limit_valid if args.limit_valid > 0 else None),
         )
-        # Persist a small metrics snapshot per epoch
-        (run_dir / "metrics").mkdir(parents=True, exist_ok=True)
-        with open(run_dir / "metrics" / f"epoch_{epoch:03d}.json", "w", encoding="utf-8") as f:
+
+        # compute global epoch index (so fine-tuning appends instead of overwriting)
+        global_epoch = epoch_offset + epoch
+
+        # Optional: embed a tiny meta block (handy when skimming files later)
+        metrics.setdefault("meta", {})
+        metrics["meta"].update({
+            "epoch_local": int(epoch),
+            "epoch_global": int(global_epoch),
+            "classes": class_names,
+        })
+
+        # Persist metrics snapshot per epoch (no overwrite)
+        with open(metrics_dir / f"epoch_{global_epoch:03d}.json", "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
-        print(f"[valid] epoch={epoch} macro_mIoU={metrics['macro_mIoU']:.4f}  "
-              f"macroDice={metrics['macro_all']['dice']:.4f}")
+
+        print(f"[valid] epoch_local={epoch} global={global_epoch}  "
+            f"macro_mIoU={metrics['macro_mIoU']:.4f}  "
+            f"macroDice={metrics['macro_all']['dice']:.4f}")
+
         return metrics
-
-    # ----- Fit -----
-    hist = trainer.fit(train_loader, validate_fn=_validate, start_epoch=0)
-
-    print("\nTraining complete." if not finetune_mode else "\nFine-tuning complete.")
-    print(f"Run directory: {run_dir.resolve()}")
-    if (ckpt_dir / "best.pth").exists():
-        print(f"Best checkpoint: {ckpt_dir / 'best.pth'}")
-
-    # Record which IDs were effectively considered train IDs this run
-    # (store the full declared train_ids, not only 'new', to allow diffs next time)
-    try:
-        _save_train_ids(run_dir, train_ids)
-    except Exception as e:
-        print(f"[meta] Failed to save train_ids manifest: {e}")
-
 
 if __name__ == "__main__":
     main()
