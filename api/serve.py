@@ -191,3 +191,5 @@ async def segment_json(
         "thresholds": THRESHOLDS,
         "image_size": [int(img.shape[0]), int(img.shape[1])],
     }
+
+
