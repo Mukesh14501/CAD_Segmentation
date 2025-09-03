@@ -1,5 +1,5 @@
 # configs/train.yaml
-epochs: 40
+epochs: 50
 batch_size: 4
 optimizer: adamw
 lr: 3.0e-4
@@ -15,4 +15,4 @@ tversky_alpha: 0.7
 tversky_beta: 0.3
 class_weights: null      # e.g., [1.0, 1.4, 1.8] (inverse sqrt freq)
 save_metric: macro_mIoU  # checkpoint by this metric
-early_stop_patience: 8
+early_stop_patience: 10

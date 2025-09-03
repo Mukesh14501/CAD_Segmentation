@@ -267,6 +267,10 @@ def main():
                     help="Freeze first N encoder stages during fine-tuning.")
     ap.add_argument("--force_full_finetune", action="store_true",
                     help="Fine-tune on ALL train IDs (not only new).")
+    
+    ap.add_argument("--replay_old_frac", type=float, default=0.5,
+                help="When classes changed, fraction of OLD train IDs to replay (0..1). Default 0.5")
+
     args = ap.parse_args()
 
     cfg = load_configs(args.configs)
@@ -324,19 +328,47 @@ def main():
 
     # ----- Datasets & Loaders -----
     train_ds = TiledDataset(
-        ds_cfg, class_names, stage="train", aug_cfg=aug_cfg, preload_index=False,
-        min_positive_area=ds_cfg.min_positive_area,
+    ds_cfg, class_names, stage="train", aug_cfg=aug_cfg, preload_index=False,
+    min_positive_area=ds_cfg.min_positive_area,
     )
-    # Restrict to IDs
-    train_ids_effective = list(train_ids)
-    if finetune_mode and not classes_changed and not args.force_full_finetune and len(new_train_ids) > 0:
-        train_ids_effective = new_train_ids
-    _filter_dataset_to_ids(train_ds, train_ids_effective)
-
     valid_ds = TiledDataset(
         ds_cfg, class_names, stage="valid", aug_cfg=aug_cfg, preload_index=False,
         min_positive_area=ds_cfg.min_positive_area,
     )
+
+    # ----- Choose which train IDs to use -----
+    rng = random.Random(ds_cfg.seed)
+
+    # Base: full train split
+    train_ids_effective = list(train_ids)
+
+    if finetune_mode and classes_changed:
+        # Split current TRAIN IDs into "old" and "new" relative to previous run
+        old_in_train = [iid for iid in train_ids if iid in set(prev_train_ids)]
+        new_in_train = [iid for iid in train_ids if iid not in set(prev_train_ids)]
+
+        # Keep all NEW images that are in the train split
+        keep_new = list(new_in_train)  # ≈80% of total NEW images
+
+        # Randomly replay a fraction of OLD images from the train split
+        frac = max(0.0, min(1.0, float(args.replay_old_frac)))
+        k_old = int(round(frac * len(old_in_train)))
+        keep_old = rng.sample(old_in_train, k_old) if 0 < k_old < len(old_in_train) else list(old_in_train)
+
+        train_ids_effective = keep_new + keep_old
+        rng.shuffle(train_ids_effective)
+
+        print(f"[ft] Class change replay -> using NEW(train)={len(keep_new)}  "
+            f"+ OLD(train)={len(keep_old)}/{len(old_in_train)} (replay_old_frac={frac}).")
+    elif finetune_mode and (not classes_changed) and (not args.force_full_finetune) and len(new_train_ids) > 0:
+        # Prior behavior: fine-tune only on NEW images since last run
+        train_ids_effective = list(new_train_ids)
+        print(f"[ft] Using NEW(train) only: {len(train_ids_effective)} images.")
+    else:
+        print(f"[ft] Using FULL train split: {len(train_ids_effective)} images.")
+
+    # Apply the selection to datasets
+    _filter_dataset_to_ids(train_ds, train_ids_effective)
     _filter_dataset_to_ids(valid_ds, valid_ids)
 
     # Class-balanced sampler for training
