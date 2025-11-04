@@ -179,6 +179,7 @@ async def segment_json(
         img_aug = _apply_flip(img, mode)
         logits = infer_full_image_logits(model, img_aug, cfg.dataset, cfg.infer, tile_bs=bs, device=DEVICE)
         logits = _invert_flip(logits, mode)
+        
         logits_list.append(logits)
     logits_merged = _merge_logits(logits_list, merge_mode)
 
