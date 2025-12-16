@@ -1,25 +1,24 @@
 # cadseg/cli/train.py
 """
-CLI: train.py (MLflow-integrated)
+CLI: train.py
+Simple end-to-end trainer with:
 - Random train/val split over the entire dataset
-- Logs ALL params/metrics/artifacts to MLflow
-- Keeps the best checkpoint in-memory only (no local files)
-- Logs and registers the best model to MLflow Model Registry
+- Fresh timestamped run directory under runs/<YYYYmmdd-HHMMSS>
+- Optional resume from the latest previous best checkpoint via --resume
 
 Usage:
-  python -m cadseg.cli.train
-  python -m cadseg.cli.train --resume   # tries to load latest model from MLflow Registry
+  python -m cadseg.cli.train            # train from scratch
+  python -m cadseg.cli.train --resume   # load latest best.pth then train
 """
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple
 import random
 import time
 import os
-from copy import deepcopy
 
 import numpy as np
 import torch
@@ -41,19 +40,13 @@ from cadseg.engine.train_loop import Trainer
 
 import mlflow
 import mlflow.pytorch
-from mlflow.tracking import MlflowClient
 
 # (Optional) corporate proxy env (safe no-op if not used)
 os.environ.setdefault("http_proxy", os.environ.get("http_proxy", ""))
 os.environ.setdefault("https_proxy", os.environ.get("https_proxy", ""))
 
-# ---------- MLflow defaults (change if you use a server/S3/DB backend) ----------
 mlflow.set_tracking_uri("file:./mlruns")
-DEFAULT_EXPERIMENT_NAME = "CAD_Segmentation"
-DEFAULT_REGISTERED_MODEL = "CAD_Segmentation"
-mlflow.set_experiment(DEFAULT_EXPERIMENT_NAME)
-
-
+mlflow.set_experiment("CAD_Segmentation")
 # ---------------------------
 # Utility helpers
 # ---------------------------
@@ -66,6 +59,37 @@ def set_seed(seed: int) -> None:
 
 def _timestamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
+
+def _read_id_list(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    ids: List[str] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s:
+                ids.append(s)
+    return ids
+
+def _write_id_list(path: Path, ids: List[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(ids) + "\n")
+
+def _filter_dataset_to_ids(ds: TiledDataset, keep_ids: List[str]) -> None:
+    """Mutate a TiledDataset to keep only images with IDs in keep_ids, then rebuild tile index."""
+    if not keep_ids:
+        return
+    idset = set(keep_ids)
+    new_paths, new_ids = [], []
+    for p, iid in zip(ds.image_paths, ds.ids):
+        if iid in idset:
+            new_paths.append(p)
+            new_ids.append(iid)
+    ds.image_paths = new_paths
+    ds.ids = new_ids
+    ds.tiles = []
+    ds._build_tile_index()  # rebuild
 
 def _all_image_ids(images_dir: Path) -> List[str]:
     paths = list_images(images_dir)
@@ -89,6 +113,33 @@ def _discover_classes(masks_root: Path) -> List[str]:
             classes.append(sub.name)
     return classes
 
+def _meta_dir(run_dir: Path) -> Path:
+    d = run_dir / "meta"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _train_manifest_path(run_dir: Path) -> Path:
+    return _meta_dir(run_dir) / "train_ids.json"
+
+def _classes_manifest_path(run_dir: Path) -> Path:
+    return _meta_dir(run_dir) / "classes.json"
+
+def _save_train_ids(run_dir: Path, ids: List[str]) -> None:
+    _train_manifest_path(run_dir).write_text(json.dumps(ids, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _save_classes(run_dir: Path, classes: List[str]) -> None:
+    _classes_manifest_path(run_dir).write_text(json.dumps(classes, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _maybe_save_splits(root: Path, train_ids: List[str], valid_ids: List[str]) -> None:
+    """Persist splits (overwrite with current results)."""
+    splits_dir = root / "splits"
+    splits_dir.mkdir(parents=True, exist_ok=True)
+    _write_id_list(splits_dir / "train.txt", train_ids)
+    _write_id_list(splits_dir / "valid.txt", valid_ids)
+
+# ---------------------------
+# New: simple random split over the entire dataset
+# ---------------------------
 def _random_split_ids(
     images_dir: Path,
     seed: int,
@@ -100,49 +151,17 @@ def _random_split_ids(
     k_valid = int(round(valid_ratio * len(ids)))
     valid_ids = sorted(ids[:k_valid], key=lambda s: int(s))
     train_ids = sorted(ids[k_valid:], key=lambda s: int(s))
-    counters = {"total": len(ids), "train": len(train_ids), "valid": len(valid_ids)}
+    counters = {
+        "total": len(ids),
+        "train": len(train_ids),
+        "valid": len(valid_ids),
+    }
     return train_ids, valid_ids, counters
 
-def _to_plain(obj: Any) -> Any:
-    """Best-effort conversion of config objects to plain dicts for MLflow logging."""
-    try:
-        # dataclass?
-        from dataclasses import asdict, is_dataclass
-        if is_dataclass(obj):
-            return asdict(obj)
-    except Exception:
-        pass
-    # objects with __dict__
-    if hasattr(obj, "__dict__"):
-        out = {}
-        for k, v in obj.__dict__.items():
-            if not k.startswith("_"):
-                out[k] = _to_plain(v)
-        return out
-    # lists/tuples
-    if isinstance(obj, (list, tuple)):
-        return [_to_plain(v) for v in obj]
-    # dicts
-    if isinstance(obj, dict):
-        return {k: _to_plain(v) for k, v in obj.items()}
-    # primitives
-    return obj
-
-def _flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = ".") -> Dict[str, Any]:
-    """Flatten nested dicts for MLflow params/metrics."""
-    items: Dict[str, Any] = {}
-    for k, v in d.items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else k
-        if isinstance(v, dict):
-            items.update(_flatten_dict(v, new_key, sep=sep))
-        else:
-            # cast list to json string for params; numbers pass through
-            if isinstance(v, (list, tuple, set)):
-                items[new_key] = json.dumps(list(v), ensure_ascii=False)
-            else:
-                items[new_key] = v
-    return items
-
+# ---------------------------
+# Validation (full-image, stitched)
+# ---------------------------
+@torch.inference_mode()
 def _evaluate_on_ids(
     model: torch.nn.Module,
     class_names: List[str],
@@ -153,7 +172,7 @@ def _evaluate_on_ids(
     tile_bs: int = 8,
     device: Optional[torch.device] = None,
     limit: Optional[int] = None,
-) -> Dict[str, Any]:
+) -> Dict:
     """
     Run stitched validation ONLY on the provided image IDs.
     Returns metrics dict with an extra top-level key 'macro_mIoU' for Trainer.
@@ -198,13 +217,13 @@ def _evaluate_on_ids(
 
         count += 1
 
-    out: Dict[str, Any] = metrics.compute()
-    out["macro_mIoU"] = float(out["macro_all"]["iou"])
+    out = metrics.compute()
+    out["macro_mIoU"] = out["macro_all"]["iou"]
     return out
 
 def _load_checkpoint_flexible(model, state):
     model_state = model.state_dict()
-    loaded, skipped_from_ckpt = 0, 0
+    loaded, skipped_from_ckpt, missing_in_model, unexpected_in_ckpt = 0, 0, 0, 0
     new_state = {}
 
     for k, v in state["model"].items():
@@ -214,10 +233,11 @@ def _load_checkpoint_flexible(model, state):
         else:
             skipped_from_ckpt += 1
 
+    unexpected_in_ckpt = len(state["model"]) - (loaded + skipped_from_ckpt)
+    missing_in_model = len(model_state) - len(new_state)
+
     model_state.update(new_state)
     model.load_state_dict(model_state, strict=False)
-    missing_in_model = len(model_state) - len(new_state)
-    unexpected_in_ckpt = len(state["model"]) - (loaded + skipped_from_ckpt)
     return {
         "loaded": loaded,
         "skipped_from_ckpt": skipped_from_ckpt,
@@ -225,38 +245,19 @@ def _load_checkpoint_flexible(model, state):
         "unexpected_in_ckpt": unexpected_in_ckpt,
     }
 
-def _try_resume_from_registry(model, registered_model_name: str) -> None:
-    """
-    If --resume is passed, try to load the latest version from MLflow Model Registry.
-    Prefers 'Production', then 'Staging', else highest version number.
-    """
-    try:
-        client = MlflowClient()
-        mv = None
-        # prefer stage
-        for stage in ["Production", "Staging"]:
-            vs = client.get_latest_versions(registered_model_name, stages=[stage])
-            if vs:
-                mv = vs[0]
-                break
-        if mv is None:
-            # fallback to highest version
-            all_versions = client.search_model_versions(f"name='{registered_model_name}'")
-            if all_versions:
-                mv = sorted(all_versions, key=lambda x: int(x.version))[-1]
-        if mv is None:
-            print(f"[resume] No versions found for registered model '{registered_model_name}'.")
-            return
-        uri = f"models:/{registered_model_name}/{mv.version}"
-        print(f"[resume] Loading model from registry: {uri}")
-        loaded = mlflow.pytorch.load_model(uri)
-        # load weights into current architecture
-        state = {"model": loaded.state_dict()}
-        stats = _load_checkpoint_flexible(model, state)
-        print(f"[resume] Loaded from registry (loaded={stats['loaded']}, skipped={stats['skipped_from_ckpt']}).")
-    except Exception as e:
-        print(f"[resume] Failed to resume from registry: {e}")
-
+def _find_latest_best_checkpoint(runs_dir: Path) -> Optional[Path]:
+    """Scan runs/*/checkpoints/best.pth and return the newest by mtime, if any."""
+    candidates = []
+    if runs_dir.exists():
+        for run in runs_dir.iterdir():
+            if not run.is_dir():
+                continue
+            p = run / "checkpoints" / "best.pth"
+            if p.exists():
+                candidates.append(p)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 # ---------------------------
 # Main
@@ -264,9 +265,7 @@ def _try_resume_from_registry(model, registered_model_name: str) -> None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--resume", action="store_true",
-                    help="If set, try to load the latest registered model from MLflow before training.")
-    ap.add_argument("--registered_model_name", type=str, default=DEFAULT_REGISTERED_MODEL,
-                    help="MLflow Registered Model name to use.")
+                    help="If set, load latest previous best.pth before training.")
     args = ap.parse_args()
 
     # Load configs (path fixed to 'configs' as per your project structure)
@@ -276,22 +275,32 @@ def main():
     # Reproducible randomness for the random split
     set_seed(ds_cfg.seed)
 
+    # Fresh timestamped run directory
+    run_dir = Path("runs") / _timestamp()
+    ckpt_dir = run_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    metrics_dir = run_dir / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[run] Run directory: {run_dir.resolve()}")
+
     # ----- Auto-discover classes from masks directory -----
     discovered = _discover_classes(ds_cfg.masks_path)
-    if discovered and set(discovered) != set(ds_cfg.classes):
-        print(f"[classes] Overriding dataset classes from masks: {ds_cfg.classes} -> {discovered}")
+    if discovered:
+        if set(discovered) != set(ds_cfg.classes):
+            print(f"[classes] Overriding dataset classes from masks: {ds_cfg.classes} -> {discovered}")
         class_names = discovered
     else:
-        class_names = list(ds_cfg.classes)
+        class_names = list(ds_cfg.classes)  # fallback to config
     md_cfg.num_classes = len(class_names)
     C = len(class_names)
 
     # ----- Random split over the entire dataset -----
-    valid_ratio = getattr(ds_cfg, "valid_ratio", 0.2)
+    valid_ratio = getattr(ds_cfg, "valid_ratio", 0.2)  # default 20% valid if not present
     train_ids, valid_ids, ctrs = _random_split_ids(ds_cfg.images_path, seed=ds_cfg.seed, valid_ratio=valid_ratio)
+    _maybe_save_splits(ds_cfg.root_path, train_ids, valid_ids)
     print(f"[split] total={ctrs['total']}  train={ctrs['train']}  valid={ctrs['valid']}  (valid_ratio={valid_ratio})")
 
-    # ----- Datasets & Loader -----
+    # ----- Datasets & Loaders -----
     train_ds = TiledDataset(
         ds_cfg, class_names, stage="train", aug_cfg=aug_cfg, preload_index=False,
         min_positive_area=ds_cfg.min_positive_area,
@@ -300,6 +309,8 @@ def main():
         ds_cfg, class_names, stage="valid", aug_cfg=aug_cfg, preload_index=False,
         min_positive_area=ds_cfg.min_positive_area,
     )
+    _filter_dataset_to_ids(train_ds, train_ids)
+    _filter_dataset_to_ids(valid_ds, valid_ids)
 
     sampler = ClassBalancedBatchSampler(
         train_ds,
@@ -316,12 +327,23 @@ def main():
         collate_fn=default_collate,
     )
 
-    # ----- Model / Loss -----
+    # ----- Model, optional resume, loss -----
     model = build_model(md_cfg)
 
-    # Optional resume from MLflow Model Registry
     if args.resume:
-        _try_resume_from_registry(model, args.registered_model_name)
+        latest_ckpt = _find_latest_best_checkpoint(Path("runs"))
+        if latest_ckpt is None:
+            print("[resume] No previous best.pth found under runs/*; proceeding from scratch.")
+        else:
+            try:
+                state = torch.load(latest_ckpt, map_location="cpu")
+                stats = _load_checkpoint_flexible(model, state)
+                print(f"[resume] Loaded '{latest_ckpt}' "
+                      f"(loaded={stats['loaded']}, skipped={stats['skipped_from_ckpt']}, "
+                      f"missing_in_model={stats['missing_in_model']}, unexpected_in_ckpt={stats['unexpected_in_ckpt']}).")
+            except Exception as e:
+                print(f"[resume] Failed to load '{latest_ckpt}': {e}")
+                print("[resume] Proceeding from scratch.")
 
     # Loss weights (optional): from train.yaml class_weights or leave None
     bce_pos_weight = tr_cfg.class_weights if tr_cfg.class_weights is not None else None
@@ -341,120 +363,68 @@ def main():
         model=model,
         loss_fn=loss_fn,
         cfg=tr_cfg,
-        save_dir=None,  # <-- disable trainer file I/O; we’ll handle model saving via MLflow
+        save_dir=str(ckpt_dir),
     )
 
     device = _pick_device()
 
-    # ---------- MLflow run ----------
-    run_name = f"run-{_timestamp()}"
-    with mlflow.start_run(run_name=run_name) as run:
-        run_id = run.info.run_id
-        # ---- Log params (flattened) ----
-        params = {
-            "env.device": str(device),
-            "env.cuda_available": torch.cuda.is_available(),
-            "env.torch_version": torch.__version__,
-            "env.seed": int(ds_cfg.seed),
-            "data.num_classes": int(C),
-            "data.class_names": json.dumps(class_names, ensure_ascii=False),
-            "split.valid_ratio": valid_ratio,
-            "split.counts": json.dumps(ctrs),
-        }
-        # dump configs
-        params.update({f"cfg.dataset.{k}": v for k, v in _flatten_dict(_to_plain(ds_cfg)).items()})
-        params.update({f"cfg.model.{k}": v for k, v in _flatten_dict(_to_plain(md_cfg)).items()})
-        params.update({f"cfg.train.{k}": v for k, v in _flatten_dict(_to_plain(tr_cfg)).items()})
-        params.update({f"cfg.aug.{k}": v for k, v in _flatten_dict(_to_plain(aug_cfg)).items()})
-        # Convert all values to strings where needed
-        params = {k: (str(v) if isinstance(v, (dict, list, tuple)) else v) for k, v in params.items()}
-        mlflow.log_params(params)
+    def _next_epoch_offset(dirpath: Path) -> int:
+        """Return max existing epoch index + 1, or 0 if none."""
+        max_idx = -1
+        for p in dirpath.glob("epoch_*.json"):
+            stem = p.stem  # e.g., "epoch_012"
+            try:
+                idx = int(stem.split("_")[-1])
+                if idx > max_idx:
+                    max_idx = idx
+            except ValueError:
+                pass
+        return max_idx + 1
 
-        # Log split & classes as artifacts
-        mlflow.log_text("\n".join(train_ids) + "\n", artifact_file="splits/train.txt")
-        mlflow.log_text("\n".join(valid_ids) + "\n", artifact_file="splits/valid.txt")
-        mlflow.log_text(json.dumps(class_names, ensure_ascii=False, indent=2), artifact_file="meta/classes.json")
+    epoch_offset = _next_epoch_offset(metrics_dir)
+    print(f"[metrics] starting global epoch index at = {epoch_offset}")
 
-        # ------ In-memory best checkpoint tracking ------
-        best_metric = -1.0
-        best_state_dict = None
-
-        # Validation callback using stitched eval on VALID split
-        def _validate(epoch: int) -> Dict[str, Any]:
-            nonlocal best_metric, best_state_dict
-
-            # ---- Eval ----
-            metrics = _evaluate_on_ids(
-                model, class_names, ds_cfg, valid_ids,
-                thresholds=0.5,
-                tile_bs=getattr(tr_cfg, "tile_bs", 8),
-                device=device,
-                limit=None,
-            )
-
-            # ---- Meta ----
-            metrics.setdefault("meta", {}).update({
-                "epoch_local": int(epoch),
-                "classes": class_names,
-            })
-
-            # ---- Log numerics (flattened) ----
-            flat = _flatten_dict(metrics)
-            numeric = {k: float(v) for k, v in flat.items() if isinstance(v, (int, float, np.floating))}
-
-            # Short aliases
-            macro_miou = float(metrics.get("macro_mIoU", float("nan")))
-            macro_dice = float(metrics.get("macro_all", {}).get("dice", float("nan")))
-            numeric["macro_mIoU"] = macro_miou
-            numeric["macroDice"] = macro_dice
-
-            mlflow.log_metrics(numeric, step=epoch)
-
-            # ---- Persist full structured metrics for this epoch ----
-            mlflow.log_dict(metrics, f"metrics/epoch_{epoch:03d}.json")
-
-            # ---- Per-class scalars (so they render in MLflow UI) ----
-            pc = metrics.get("per_class") or {}
-            for key in ("iou", "dice", "precision", "recall", "tp", "fp", "fn", "tn", "support_px"):
-                vals = pc.get(key, [])
-                for i, val in enumerate(vals if isinstance(vals, list) else []):
-                    if isinstance(val, (int, float, np.floating)):
-                        mlflow.log_metric(f"per_class.{key}[{i}]", float(val), step=epoch)
-
-            # ---- Track best ----
-            if macro_miou > best_metric:
-                best_metric = macro_miou
-                best_state_dict = deepcopy(model.state_dict())
-
-            print(f"[valid] epoch={epoch}  macro_mIoU={macro_miou:.4f}  macroDice={macro_dice:.4f}")
-            return metrics
-
-
-        # ----- Fit -----
-        trainer.fit(train_loader, validate_fn=_validate, start_epoch=0)
-
-        print("\nTraining complete.")
-
-        # ----- Log and Register the BEST model -----
-        if best_state_dict is not None:
-            model.load_state_dict(best_state_dict)
-        else:
-            print("[warn] best_state_dict was None; logging the final model weights.")
-
-        # Log model artifact to this run
-        artifact_path = "model"
-
-        # Logs the model to the run *and* registers it under the given name.
-        # (Requires MLflow >= 2.x where flavors support `registered_model_name`.)
-        info = mlflow.pytorch.log_model(
-            model,
-            artifact_path=artifact_path,
-            registered_model_name=args.registered_model_name,
+    # Validation callback using full-image stitched eval on the VALID split only
+    def _validate(epoch: int) -> Dict:
+        metrics = _evaluate_on_ids(
+            model, class_names, ds_cfg, valid_ids,
+            thresholds=0.5, tile_bs=getattr(tr_cfg, "tile_bs", 8), device=device,
+            limit=None,
         )
 
-        print(f"[mlflow] Logged & registered model as '{args.registered_model_name}'.")
-        print(f"[mlflow] Model URI: {info.model_uri}")
+        global_epoch = epoch_offset + epoch
+        metrics.setdefault("meta", {})
+        metrics["meta"].update({
+            "epoch_local": int(epoch),
+            "epoch_global": int(global_epoch),
+            "classes": class_names,
+        })
 
+        with open(metrics_dir / f"epoch_{global_epoch:03d}.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)  
+
+        print(f"[valid] epoch_local={epoch} global={global_epoch}  "
+              f"macro_mIoU={metrics['macro_mIoU']:.4f}  "
+              f"macroDice={metrics['macro_all']['dice']:.4f}")
+        
+        return metrics
+
+    # ----- Fit -----
+    trainer.fit(train_loader, validate_fn=_validate, start_epoch=0)
+
+    print("\nTraining complete.")
+    print(f"Run directory: {run_dir.resolve()}")
+    if (ckpt_dir / "best.pth").exists():
+        print(f"Best checkpoint: {ckpt_dir / 'best.pth'}")
+
+    # Save run-level manifests (optional)
+    try:
+        _save_train_ids(run_dir, train_ids)
+        _save_classes(run_dir, class_names)
+    except Exception as e:
+        print(f"[meta] Failed to save run manifests: {e}")
 
 if __name__ == "__main__":
     main()
+
+
