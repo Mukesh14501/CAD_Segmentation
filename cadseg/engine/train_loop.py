@@ -2,7 +2,9 @@
 from __future__ import annotations
 from typing import Callable, Optional, Dict, Any, Tuple
 from dataclasses import dataclass
+from pathlib import Path
 
+import math
 import torch
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
@@ -23,12 +25,28 @@ def _pick_device() -> torch.device:
     return torch.device("cpu")
 
 
+class _NullCheckpointManager:
+    """No-op stand-in when we don't want local checkpoint files."""
+    def save(
+        self,
+        *,
+        epoch: int,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+        scaler: Optional[torch.cuda.amp.GradScaler],
+        monitor_value: float,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        return  # intentionally do nothing
+
+
 @dataclass
 class Trainer:
     model: torch.nn.Module
     loss_fn: torch.nn.Module
     cfg: TrainConfig
-    save_dir: str
+    save_dir: Optional[str] = None
     device: Optional[torch.device] = None
 
     def __post_init__(self):
@@ -36,29 +54,41 @@ class Trainer:
         self.model.to(self.device)
         self.loss_fn.to(self.device)
 
-        # Optimizer (built now; scheduler waits for loader length)
+        # Optimizer/scaler
         self.optimizer = build_optimizer(self.model, self.cfg)
         self.scaler = torch.cuda.amp.GradScaler(enabled=(self.cfg.amp and self.device.type == "cuda"))
 
-        self.ckpt = CheckpointManager(save_dir=torch.path.Path(self.save_dir) if hasattr(torch, "path") else __import__("pathlib").Path(self.save_dir),
-                                      monitor=self.cfg.save_metric, mode="max")
+        # Checkpoint manager: real or no-op
+        if self.save_dir:
+            self.ckpt = CheckpointManager(
+                save_dir=Path(self.save_dir),
+                monitor=self.cfg.save_metric,
+                mode="max",
+            )
+        else:
+            self.ckpt = _NullCheckpointManager()
 
-        # Encoder warmup freeze
+        # Optional encoder freeze
         if self.cfg.freeze_encoder_stages:
             freeze_encoder_stages(self.model, self.cfg.freeze_encoder_stages)
+
+        self.scheduler = None
+        self.sched_mode = None
 
     def _build_scheduler(self, steps_per_epoch: int):
         self.scheduler, self.sched_mode = build_scheduler(self.optimizer, self.cfg, steps_per_epoch)
 
-    def _train_one_epoch(self, loader: DataLoader, epoch: int) -> Tuple[float, float]:
+    def _train_one_epoch(self, loader: DataLoader, epoch: int) -> Tuple[float, int]:
         self.model.train(True)
         running_loss = 0.0
-        num = 0
+        seen = 0
 
         pbar = tqdm(loader, desc=f"Epoch {epoch} [train]", ncols=100, leave=False)
         for step, batch in enumerate(pbar, start=1):
             imgs = batch["image"].to(self.device, non_blocking=True)
-            masks = batch["mask"].to(self.device, non_blocking=True) if "mask" in batch else None
+            masks = batch.get("mask")
+            if masks is not None:
+                masks = masks.to(self.device, non_blocking=True)
 
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -73,7 +103,6 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                # CPU or MPS or AMP disabled
                 logits = self.model(imgs)
                 loss = self.loss_fn(logits, masks)
                 loss.backward()
@@ -82,20 +111,24 @@ class Trainer:
                 self.optimizer.step()
 
             running_loss += loss.item() * imgs.size(0)
-            num += imgs.size(0)
+            seen += imgs.size(0)
 
-            # LR schedule per batch?
+            # Per-batch schedule
             if self.scheduler is not None and self.sched_mode == "batch":
                 self.scheduler.step()
 
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}"})
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+            })
 
-        avg_loss = running_loss / max(1, num)
-        # LR schedule per epoch?
+        avg_loss = running_loss / max(1, seen)
+
+        # Per-epoch schedule
         if self.scheduler is not None and self.sched_mode == "epoch":
             self.scheduler.step()
 
-        return avg_loss, num
+        return avg_loss, seen
 
     def fit(
         self,
@@ -104,62 +137,71 @@ class Trainer:
         validate_fn: Optional[Callable[[int], Dict[str, Any]]] = None,
         start_epoch: int = 0,
     ) -> Dict[str, Any]:
-        """
-        Train for cfg.epochs. If validate_fn is provided, it will be called at the end of each epoch:
-            metrics = validate_fn(epoch)
-        Trainer expects `metrics` to include the monitored key cfg.save_metric (e.g., "macro_mIoU").
-        If no validate_fn, we'll monitor negative training loss instead (so lower loss → "higher" metric).
-        """
-        # Build scheduler now that we know steps_per_epoch
+        def _is_better(curr: float, best: Optional[float], min_delta: float = 0.0) -> bool:
+            if best is None:
+                return True
+            return (curr - best) > min_delta  # maximize with tolerance
+
+        # Build scheduler when we know steps/epoch
         self._build_scheduler(steps_per_epoch=max(1, len(train_loader)))
 
-        best_metric = None
+        best_metric: Optional[float] = None
         epochs_no_improve = 0
+        monitor_key = self.cfg.save_metric if validate_fn is not None else "neg_train_loss"
+        min_delta = getattr(self.cfg, "early_stop_min_delta", 0.0)
 
         for epoch in range(start_epoch, self.cfg.epochs):
-            # Unfreeze encoder at the configured epoch
-            if epoch == self.cfg.unfreeze_at_epoch:
+            # Timed unfreeze
+            if epoch == getattr(self.cfg, "unfreeze_at_epoch", -1):
                 unfreeze_all(self.model)
 
             train_loss, _ = self._train_one_epoch(train_loader, epoch)
 
-            # Validation (optional, Step 8 will provide validate_fn)
             if validate_fn is not None:
                 metrics = validate_fn(epoch) or {}
-                monitor_value = float(metrics.get(self.cfg.save_metric, float("nan")))
+                raw_val = metrics.get(self.cfg.save_metric, None)
+                monitor_value = float(raw_val) if (raw_val is not None) else float("nan")
             else:
                 metrics = {"train_loss": train_loss}
-                # monitor negative loss to "maximize" (so lower loss appears better)
-                monitor_value = -train_loss
+                monitor_value = -float(train_loss)  # maximize negative loss
 
-            # Plateau LR requires metric
-            if self.scheduler is not None and self.sched_mode == "plateau":
+            invalid = (
+                (monitor_value is None)
+                or math.isnan(monitor_value)
+                or math.isinf(monitor_value)
+            )
+
+            # Plateaulike schedulers
+            if self.scheduler is not None and self.sched_mode == "plateau" and not invalid:
                 self.scheduler.step(monitor_value)
 
-            # Save checkpoints
+            # Save (no-op if _NullCheckpointManager)
             self.ckpt.save(
                 epoch=epoch,
                 model=self.model,
                 optimizer=self.optimizer,
                 scheduler=self.scheduler,
                 scaler=self.scaler,
-                monitor_value=monitor_value,
+                monitor_value=(monitor_value if not invalid else (best_metric if best_metric is not None else float("-inf"))),
                 extra={"metrics": metrics},
             )
 
-            # Logging summary
+            # Log summary line
             log_kv(
                 f"[epoch {epoch}]",
-                {"train_loss": f"{train_loss:.4f}", self.cfg.save_metric: f"{monitor_value:.4f}"}
+                {
+                    "train_loss": f"{train_loss:.4f}",
+                    monitor_key: f"{monitor_value:.4f}" if not invalid else "NaN",
+                },
             )
 
-            # Early stopping
-            if best_metric is None or monitor_value > best_metric:
+            improved = (not invalid) and _is_better(monitor_value, best_metric, min_delta=min_delta)
+            if improved:
                 best_metric = monitor_value
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
-                if epochs_no_improve >= self.cfg.early_stop_patience:
+                if epochs_no_improve >= getattr(self.cfg, "early_stop_patience", float("inf")):
                     print(f"Early stopping at epoch {epoch} (no improvement for {self.cfg.early_stop_patience} epochs).")
                     break
 

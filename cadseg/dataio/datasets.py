@@ -66,61 +66,98 @@ def _stack_multilabel_masks(
     return M
 
 
-# ----------------------------
-# Full-image dataset
-# ----------------------------
+
+# assumes these helpers already exist in your codebase
+# from cadseg.dataio.masks import _stack_multilabel_masks
+# from cadseg.dataio.images import list_images, image_id_from_path, load_image_rgb
+# from cadseg.dataio.transforms import build_transforms
+
 class CADSegDataset(Dataset):
     """
-    Returns full images and multi-label masks (for small images or debugging).
-    __getitem__ returns:
-      - image: float tensor (3,H,W)
-      - mask : float tensor (C,H,W) in {0.,1.}
-      - meta : dict(id, size_hw)
+    Full-image, multi-label segmentation dataset.
+
+    __getitem__ returns a dict:
+      - "image": float tensor (3, H, W)
+      - "mask" : float tensor (C, H, W) in {0., 1.}
+      - "meta" : {"id": <str>, "size_hw": (H, W)}
+
+    Notes
+    -----
+    - Option A split control: pass `allowed_ids` to filter which image IDs
+      are included for this dataset instance. If None, all images in
+      `ds_cfg.images_path` are used.
     """
     def __init__(
         self,
-        ds_cfg: DatasetConfig,
+        ds_cfg,
         class_names: List[str],
         stage: str = "train",
         aug_cfg: Optional[Dict[str, Any]] = None,
         normalize: str = "imagenet",
+        allowed_ids: Optional[set[str]] = None,   # <-- NEW: whitelist of image IDs
     ):
         self.ds_cfg = ds_cfg
         self.class_names = class_names
         self.stage = stage
         self.C = len(class_names)
-        self.images_dir = ds_cfg.images_path
-        self.masks_dir = ds_cfg.masks_path
 
-        self.image_paths: List[Path] = list_images(self.images_dir)
+        self.images_dir: Path = ds_cfg.images_path
+        self.masks_dir: Path = ds_cfg.masks_path
+
+        # Discover all candidate images
+        all_paths: List[Path] = list_images(self.images_dir)
+
+        # Filter by allowed_ids if provided
+        if allowed_ids is not None:
+            # Build filtered list while preserving original ordering
+            filtered_paths: List[Path] = []
+            seen_ids: Set[str] = set()
+            for p in all_paths:
+                iid = image_id_from_path(p)
+                if iid in allowed_ids:
+                    filtered_paths.append(p)
+                    seen_ids.add(iid)
+            self.image_paths: List[Path] = filtered_paths
+            # Optional: warn if some requested ids were not found on disk
+            missing = allowed_ids - seen_ids
+            if missing:
+                print(f"[CADSegDataset:{stage}] {len(missing)} allowed_ids not found on disk (e.g., {next(iter(missing))}).")
+        else:
+            self.image_paths = all_paths
+
+        # Derive ids after filtering
         self.ids: List[str] = [image_id_from_path(p) for p in self.image_paths]
 
+        # Albumentations transform pipeline (ToTensorV2 included inside)
         self.transform = build_transforms(
             aug_cfg or {},
             stage=self.stage,
             normalize=normalize,
-            tile_size=ds_cfg.tile_size,
-            tile_overlap=ds_cfg.tile_overlap,
+            tile_size=getattr(ds_cfg, "tile_size", None),
+            tile_overlap=getattr(ds_cfg, "tile_overlap", 0),
         )
 
     def __len__(self) -> int:
         return len(self.image_paths)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        ip = self.image_paths[idx]
-        iid = self.ids[idx]
+        ip: Path = self.image_paths[idx]
+        iid: str = self.ids[idx]
 
-        img = load_image_rgb(ip)  # (H,W,3), uint8
+        img = load_image_rgb(ip)  # (H, W, 3) uint8
         H, W = img.shape[:2]
+
+        # Stack class-wise binary masks into (C, H, W) float32
         mask = _stack_multilabel_masks(self.masks_dir, self.class_names, iid, size_hw=(H, W))
 
-        # Albumentations expects dict; ToTensorV2 gives tensors
+        # Albumentations expects a dict; ToTensorV2 -> torch tensors
         out = self.transform(image=img, mask=mask)
-        image_t = out["image"]  # (3,H,W) float32
-        mask_t = out["mask"]    # (C,H,W) float32
+        image_t: torch.Tensor = out["image"]  # (3, H, W) float32
+        mask_t: torch.Tensor = out["mask"]    # (C, H, W) float32
 
         meta = {"id": iid, "size_hw": (H, W)}
         return {"image": image_t, "mask": mask_t, "meta": meta}
+
 
 
 # ----------------------------

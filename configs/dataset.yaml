@@ -2,9 +2,9 @@
 root: ./data
 images_dir: images
 masks_dir: masks
-classes: ["dimension_overlap"]
-tile_size: 1024
-tile_overlap: 256
+classes: ["dimension_overlap","model_overlap"]
+tile_size: 512
+tile_overlap: 160
 num_workers: 4
 min_positive_area: 32    # small, because overlaps are thin
 seed: 42

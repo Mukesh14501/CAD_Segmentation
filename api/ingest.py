@@ -4,20 +4,21 @@ import json
 import re
 import zipfile
 import tempfile
+import shutil
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 
-import numpy as np
-import cv2
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import JSONResponse
 
 from cadseg.config import load_configs
 
 app = FastAPI(title="CADSeg Inference API", version="1.0")
 
+os.environ.setdefault("http_proxy", os.environ.get("http_proxy", ""))
+os.environ.setdefault("https_proxy", os.environ.get("https_proxy", ""))
+
 # -----------------------------
-# Config (lazy load recommended)
+# Config (lazy load)
 # -----------------------------
 from functools import lru_cache
 
@@ -38,69 +39,30 @@ def _ensure_dir(p: Path):
 def _natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
-def _read_file_bytes(p: Path) -> bytes:
-    with open(p, "rb") as f:
-        return f.read()
-
 def _walk_files(root: Path, exts=None):
     for p in root.rglob("*"):
         if p.is_file():
             if exts is None or p.suffix.lower() in exts:
                 yield p
 
-def _scan_existing_index(images_out: Path) -> Tuple[int, int]:
+def _scan_existing_index(images_out: Path) -> int:
     """
     Scan existing images named like '^\d+\.(png|jpg|jpeg|tif|tiff|bmp)$'
-    Return (max_index, existing_zero_pad_width). If none, (0,0).
+    Return max_index. If none, 0.
     """
     pat = re.compile(r"^(\d+)\.(?:png|jpg|jpeg|tif|tiff|bmp)$", re.IGNORECASE)
     max_idx = 0
-    zpad = 0
     if not images_out.exists():
-        return 0, 0
+        return 0
     for p in images_out.iterdir():
         if not p.is_file():
             continue
         m = pat.match(p.name)
         if not m:
             continue
-        idx_str = m.group(1)
-        idx = int(idx_str)
+        idx = int(m.group(1))
         max_idx = max(max_idx, idx)
-        zpad = max(zpad, len(idx_str))
-    return max_idx, zpad
-
-# -----------------------------
-# Image / mask decoding
-# -----------------------------
-def _decode_to_rgb(data: bytes) -> Optional[np.ndarray]:
-    buf = np.frombuffer(data, dtype=np.uint8)
-    im = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
-    if im is None:
-        return None
-    if im.ndim == 2:
-        return cv2.cvtColor(im, cv2.COLOR_GRAY2RGB)
-    if im.shape[2] == 4:
-        b, g, r, a = cv2.split(im)
-        rgb = cv2.merge([r, g, b]).astype(np.float32)
-        alpha = (a.astype(np.float32) / 255.0)[..., None]
-        bg = np.full_like(rgb, 255.0)
-        out = rgb * alpha + bg * (1.0 - alpha)
-        return np.clip(out, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-
-def _read_mask_to_binary(path: Path) -> np.ndarray:
-    data = _read_file_bytes(path)
-    buf = np.frombuffer(data, dtype=np.uint8)
-    im = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
-    if im is None:
-        raise ValueError(f"Cannot decode mask: {path}")
-    if im.ndim == 3:
-        if im.shape[2] == 4:
-            im = cv2.cvtColor(im, cv2.COLOR_BGRA2GRAY)
-        else:
-            im = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-    return (im > 0).astype(np.uint8)
+    return max_idx
 
 # -----------------------------
 # Dataset meta (data/meta/state.json)
@@ -120,7 +82,6 @@ def _read_state(root_path: Path) -> Dict:
             return json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             pass
-    # default shape
     return {
         "last_upload_max_id": 0,
         "last_trained_max_id": 0,
@@ -128,10 +89,13 @@ def _read_state(root_path: Path) -> Dict:
     }
 
 def _write_state(root_path: Path, state: Dict) -> None:
-    _state_json_path(root_path).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    _state_json_path(root_path).write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
 # -----------------------------
-# API: Ingest only (no splits)
+# API: Ingest (no processing)
 # -----------------------------
 @app.post("/ingest_labelstudio")
 async def ingest_labelstudio(
@@ -140,15 +104,14 @@ async def ingest_labelstudio(
     overwrite: bool = Form(True),
 ):
     """
-    Ingest two zips (images + masks) for CADSeg training.
-
-    - Continues numbering from existing images (keeps/expands zero-padding).
-    - Maps Label Studio task IDs to newly assigned image IDs:
-        * If some images contain 'task-<id>' in their path/name, they get assigned first.
-        * Remaining images are assigned by arrival order.
-        * Every mask 'task-<id>' is mapped to the corresponding new image index.
-    - Writes masks into masks/<class>/<ID>.png (OR-merge multiples).
-    - Updates data/meta/state.json with 'last_upload_max_id'.  (Splits are owned by the trainer.)
+    Ingest two zips (images + masks) for CADSeg training with minimal logic:
+      - No decoding, no validation, no resizing, no alpha handling.
+      - Just extract and copy files.
+      - Continues numbering from existing images.
+      - Final saved names have NO leading zeros (e.g., '06.png' -> '6.png').
+      - Masks: for each (task, class), the FIRST mask found is copied to masks/<class>/<ID>.png
+               (no merging of multiple parts).
+      - Updates data/meta/state.json with 'last_upload_max_id'.
     """
     cfg = get_cfg()
     images_out = Path(cfg.dataset.images_path)
@@ -158,8 +121,8 @@ async def ingest_labelstudio(
     _ensure_dir(images_out)
     _ensure_dir(masks_out_root)
 
-    # --- scan existing image index & padding ---
-    current_max, existing_pad = _scan_existing_index(images_out)
+    # current max index (existing images like '12.png')
+    current_max = _scan_existing_index(images_out)
 
     with tempfile.TemporaryDirectory() as tmpd:
         tmp = Path(tmpd)
@@ -175,7 +138,7 @@ async def ingest_labelstudio(
         with zipfile.ZipFile(masks_zip_path, "r") as z:
             z.extractall(masks_dir)
 
-        # collect images
+        # collect images (as-is)
         img_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
         image_files = sorted([p for p in _walk_files(images_dir, img_exts)], key=lambda p: _natural_key(p.name))
         if not image_files:
@@ -184,7 +147,6 @@ async def ingest_labelstudio(
         N = len(image_files)
         start_idx = current_max + 1
         end_idx   = start_idx + N - 1
-        zpad = max(existing_pad, len(str(end_idx)))
 
         # Build possible mapping task-id -> image file (if images contain task-<id> in path/name)
         tid_pat = re.compile(r"task[-_](\d+)", re.IGNORECASE)
@@ -197,8 +159,9 @@ async def ingest_labelstudio(
             else:
                 imgs_no_tid.append(p)
 
-        # Parse masks and group parts per (task, class)
-        mask_pat = re.compile(r"task-(\d+).*?-tag-([A-Za-z0-9_]+)-")
+        # Parse masks and group per (task, class)
+        # We will copy only the FIRST mask file per (task, class); no merging/processing.
+        mask_pat = re.compile(r"task-(\d+).*?-tag-([A-Za-z0-9_]+)-", re.IGNORECASE)
         mask_files = [p for p in _walk_files(masks_dir, None)]
         groups: Dict[Tuple[int, str], List[Path]] = {}
         task_ids = set()
@@ -210,120 +173,93 @@ async def ingest_labelstudio(
             task_ids.add(task)
             groups.setdefault((task, cls), []).append(p)
 
-        if not task_ids:
-            # It's valid to ingest images without masks, but warn
-            class_names = []
-            written_masks = 0
-        else:
-            # Determine new IDs and save images, building:
-            # - task_to_new_idx (for masks)
-            task_to_new_idx: Dict[int, int] = {}
-            id_map: Dict[int, str] = {}  # new index -> filename
+        # Assign indices
+        task_to_new_idx: Dict[int, int] = {}
+        assigned_indices: set[int] = set()
+        next_free_idx = start_idx
 
-            # Assign indices incrementally
-            assigned_indices: set[int] = set()
-            next_free_idx = start_idx
+        def _next_index() -> int:
+            nonlocal next_free_idx
+            idx = next_free_idx
+            next_free_idx += 1
+            return idx
 
-            def _next_index() -> int:
-                nonlocal next_free_idx
-                idx = next_free_idx
-                next_free_idx += 1
-                return idx
-
-            # Write function to actually save an image to the numbered target
-            def _save_image_to_index(src_path: Path, idx: int) -> str:
-                target_name = f"{idx:0{zpad}d}.png"
-                target_path = images_out / target_name
-                if target_path.exists() and not overwrite:
-                    return target_name
-                rgb = _decode_to_rgb(_read_file_bytes(src_path))
-                if rgb is None:
-                    raise HTTPException(status_code=400, detail=f"Cannot decode image: {src_path.name}")
-                ok = cv2.imwrite(str(target_path), rgb[:, :, ::-1])
-                if not ok:
-                    raise HTTPException(status_code=500, detail=f"Failed to save image: {target_name}")
+        # Save function: copy file bytes as-is; strip leading zeros in final name
+        def _copy_to_images(src_path: Path, idx: int) -> str:
+            # ensure plain number without leading zeros
+            target_name = f"{idx}.png"
+            target_path = images_out / target_name
+            if target_path.exists() and not overwrite:
                 return target_name
+            # copy file bytes directly; if not PNG source, we still save as .png filename
+            # (as requested: no validation/processing). This keeps things simple.
+            with open(src_path, "rb") as rf, open(target_path, "wb") as wf:
+                shutil.copyfileobj(rf, wf)
+            return target_name
 
-            # 1) images with known task ids
-            for tid, src in img_task_map.items():
-                idx = _next_index()
-                fname = _save_image_to_index(src, idx)
-                id_map[idx] = fname
-                task_to_new_idx[tid] = idx
-                assigned_indices.add(idx)
+        # 1) images with known task ids
+        id_map: Dict[int, str] = {}  # new index -> filename
+        for tid, src in img_task_map.items():
+            idx = _next_index()
+            fname = _copy_to_images(src, idx)
+            id_map[idx] = fname
+            task_to_new_idx[tid] = idx
+            assigned_indices.add(idx)
 
-            # 2) remaining images (no task id on filename): assign in remaining order
-            for src in imgs_no_tid:
-                idx = _next_index()
-                fname = _save_image_to_index(src, idx)
-                id_map[idx] = fname
+        # 2) remaining images (no task id)
+        for src in imgs_no_tid:
+            idx = _next_index()
+            fname = _copy_to_images(src, idx)
+            id_map[idx] = fname
 
-            # 3) ensure every task id gets an index (if task didn’t appear in image filenames)
-            all_indices = list(range(start_idx, start_idx + N))
-            free_indices = [i for i in all_indices if i not in assigned_indices]
-            fi = 0
-            for t in sorted(task_ids):
-                if t not in task_to_new_idx:
-                    if fi >= len(free_indices):
-                        raise HTTPException(status_code=500, detail="Internal mapping error (free index exhausted).")
-                    task_to_new_idx[t] = free_indices[fi]; fi += 1
+        # 3) ensure every task id gets an index (if task didn’t appear in image filenames)
+        all_indices = list(range(start_idx, start_idx + N))
+        free_indices = [i for i in all_indices if i not in assigned_indices]
+        fi = 0
+        for t in sorted(task_ids):
+            if t not in task_to_new_idx:
+                if fi >= len(free_indices):
+                    raise HTTPException(status_code=500, detail="Internal mapping error (free index exhausted).")
+                task_to_new_idx[t] = free_indices[fi]; fi += 1
 
-            # ----- Write masks -----
-            class_names = sorted({cls for (_, cls) in groups.keys()})
-            for cls in class_names:
-                _ensure_dir(masks_out_root / cls)
+        # ----- Write masks (FIRST file only per (task, class)) -----
+        class_names = sorted({cls for (_, cls) in groups.keys()})
+        for cls in class_names:
+            _ensure_dir(masks_out_root / cls)
 
-            written_masks = 0
-            for (task, cls), parts in groups.items():
-                idx = task_to_new_idx[task]
-                # load & OR-union parts
-                combined = None
-                for part in parts:
-                    m = _read_mask_to_binary(part)
-                    if combined is None:
-                        combined = m.astype(np.uint8)
-                    else:
-                        if combined.shape != m.shape:
-                            m = cv2.resize(m, (combined.shape[1], combined.shape[0]), interpolation=cv2.INTER_NEAREST)
-                        combined = np.maximum(combined, m)
-                if combined is None:
-                    continue
-                target_name = f"{idx:0{zpad}d}.png"
-                target_path = masks_out_root / cls / target_name
-                if target_path.exists() and not overwrite:
-                    continue
-                if cv2.imwrite(str(target_path), (combined * 255).astype(np.uint8)):
-                    written_masks += 1
+        written_masks = 0
+        for (task, cls), parts in groups.items():
+            idx = task_to_new_idx[task]
+            target_name = f"{idx}.png"  # no leading zeros
+            target_path = masks_out_root / cls / target_name
+            if target_path.exists() and not overwrite:
+                continue
+            # copy the FIRST mask file as-is
+            src = parts[0]
+            with open(src, "rb") as rf, open(target_path, "wb") as wf:
+                shutil.copyfileobj(rf, wf)
+            written_masks += 1
 
-        # Save any images that may not have been written (case: no masks at all)
+        # Case: no masks; still need to ensure all images were copied.
         if not task_ids:
-            # When no masks ZIP or no task-ids present, we still need to write all images sequentially.
-            next_idx = start_idx
-            for src in image_files:
-                target_name = f"{next_idx:0{zpad}d}.png"
-                target_path = images_out / target_name
-                if (not target_path.exists()) or overwrite:
-                    rgb = _decode_to_rgb(_read_file_bytes(src))
-                    if rgb is None:
-                        raise HTTPException(status_code=400, detail=f"Cannot decode image: {src.name}")
-                    if not cv2.imwrite(str(target_path), rgb[:, :, ::-1]):
-                        raise HTTPException(status_code=500, detail=f"Failed to save image: {target_name}")
-                next_idx += 1
+            # Copy all images sequentially if somehow missed above (normally already done).
+            # This block is effectively a no-op in this simpler flow, but kept for clarity.
+            pass
 
         # ---- Update dataset meta/state.json ----
         state = _read_state(root_path)
         prev_upload_max = int(state.get("last_upload_max_id", 0))
         state["last_upload_max_id"] = max(prev_upload_max, end_idx)
-        # leave last_trained_max_id and prev_classes untouched; trainer will update
         _write_state(root_path, state)
 
         return {
             "existing_max_index": current_max,
             "start_index": start_idx,
             "end_index": end_idx,
-            "zpad_used": zpad,
-            "images_written_estimate": N,     # images saved equals N unless overwrite=False skipped existing
-            "classes_detected": class_names if task_ids else [],
-            "masks_written": written_masks if task_ids else 0,
+            "zpad_used": 0,  # always 0 now; filenames have no leading zeros
+            "images_written_estimate": N,
+            "classes_detected": class_names,
+            "masks_written": written_masks,
             "meta_updated": {"last_upload_max_id": state["last_upload_max_id"]},
+            "notes": "No image/mask processing performed; files copied as-is. First mask per (task,class) only.",
         }
